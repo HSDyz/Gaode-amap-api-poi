@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-高德地图 POI 数据采集工具
+By YZ
 """
-
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import threading
 import math
 import json
@@ -25,19 +24,32 @@ from collections import defaultdict
 # 默认设置文件位置
 DEFAULT_SETTINGS_FILE = os.path.join(os.path.expanduser("~"), "setting.json")
 
-# 核心配置（贴合高德API规范）
+# 核心配置
 REQUEST_INTERVAL = 3.0  # 普通请求间隔（秒）
-KEY_SWITCH_DELAY = 6.0  # Key切换后延迟（秒）- 改为6秒
+KEY_SWITCH_DELAY = 6.0  # Key切换后延迟（秒）- 6秒
 ERROR_DELAY = 5.0  # 异常后延迟（秒）
-KEY_COOLDOWN_TIME = 3000  # 临时超限Key冷却时间（秒）
+DEFAULT_SHORT_COOLDOWN = 180  # 初始短冷却：3分钟（秒）
 KEY_MAX_USAGE = 8000  # Key最大使用次数限制
 FLOAT_EPS = 1e-6  # 浮点数精度容错
 
+# 高德Key错误类型常量（用于精准识别）
+KEY_ERROR_PERMANENT = "INVALID_USER_KEY"  # 10001 永久无效
+KEY_ERROR_PLAT_MISMATCH = "USERKEY_PLAT_NOMATCH"  # 10009 平台不匹配
+KEY_ERROR_DAILY_LIMIT = "USER_DAILY_QUERY_OVER_LIMIT"  # 10044 临时日超限
+KEY_ERROR_QPS_LIMIT = "USER_QPS_OVER_LIMIT"  # 临时QPS超限
 
-# ==============================================================================
-# 核心逻辑类
-# ==============================================================================
+# =======================================================================
+# 辅助函数
+# =======================================================================
+def seconds_until_next_midnight():
+    """计算当前时间到下一日 00:00 的秒数"""
+    now = datetime.datetime.now()
+    tomorrow = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return int((tomorrow - now).total_seconds())
 
+# =======================================================================
+# 核心逻辑类（Key 管理 + 爬取逻辑）
+# =======================================================================
 class CoordinateConverter:
     def __init__(self):
         self.x_pi = 3.14159265358979324 * 3000.0 / 180.0
@@ -79,117 +91,198 @@ class CoordinateConverter:
         ret += (150.0 * math.sin(lng / 12.0 * self.pi) + 300.0 * math.sin(lng / 30.0 * self.pi)) * 2.0 / 3.0
         return ret
 
-
 class KeyManager:
     def __init__(self, key_list=None, auto_rotate=True):
         self.keys = key_list or []
         self.index = 0
         self.usage_stats = {k: 0 for k in self.keys}
         self.temp_cooldown = dict()  # 临时冷却Key: 冷却结束时间戳
+        self.permanent_invalid = set()  # 永久无效Key
+        self.plat_mismatch = set()  # 平台不匹配Key
         self.auto_rotate = auto_rotate
+        self.failure_counts = defaultdict(int)  # 连续失败计数
+        # lock for thread-safety
+        self._lock = threading.RLock()
 
     def set_keys(self, key_list):
-        self.keys = key_list  # 不再过滤任何Key（去掉永久无效设置）
-        self.index = 0
-        # 保留原有统计，新key初始化为0
-        for k in self.keys:
-            if k not in self.usage_stats:
-                self.usage_stats[k] = 0
-        # 清理冷却中但已被移除的Key
-        self.temp_cooldown = {k: t for k, t in self.temp_cooldown.items() if k in self.keys}
+        with self._lock:
+            # 过滤永久无效Key
+            new_keys = [k for k in key_list if k not in self.permanent_invalid]
+            self.keys = new_keys
+            self.index = 0
+            # 新key初始化为0
+            for k in self.keys:
+                if k not in self.usage_stats:
+                    self.usage_stats[k] = 0
+            # 清理冷却/平台不匹配记录
+            self.temp_cooldown = {k: t for k, t in self.temp_cooldown.items() if k in self.keys and k not in self.permanent_invalid}
+            self.plat_mismatch = {k for k in self.plat_mismatch if k in self.keys}
 
     def get_current_key(self):
-        """获取当前可用的Key（跳过冷却和达到使用上限的）"""
-        if not self.keys:
-            return None
+        """获取当前可用的Key（跳过永久无效、平台不匹配、临时冷却、使用上限）"""
+        with self._lock:
+            if not self.keys:
+                return None
+            current_key = self.keys[self.index]
+            if self._is_key_available(current_key):
+                return current_key
+            # 否则尝试切换
+            return self.switch_key()
 
-        # 先检查当前Key是否可用
-        current_key = self.keys[self.index]
-        if self._is_key_available(current_key):
-            return current_key
-
-        # 遍历所有Key找可用的
-        return self.switch_key()
+    def any_available_keys(self):
+        """检查是否存在任意可用Key"""
+        with self._lock:
+            for k in self.keys:
+                if self._is_key_available(k):
+                    return True
+            return False
 
     def switch_key(self):
-        """切换到下一个可用的Key（切换后延迟6秒）"""
-        if not self.keys:
-            return None
-
-        start_index = self.index
-        while True:
-            self.index = (self.index + 1) % len(self.keys)
-            current_key = self.keys[self.index]
-
-            # 找到可用Key或循环一圈后返回（即使不可用也返回，避免死循环）
-            if self._is_key_available(current_key) or self.index == start_index:
-                # 切换后延迟6秒
-                time.sleep(KEY_SWITCH_DELAY)
-                return current_key
+        """切换到下一个可用的Key（若无可用Key则返回None）"""
+        with self._lock:
+            if not self.keys:
+                return None
+            start = self.index
+            found = None
+            for _ in range(len(self.keys)):
+                self.index = (self.index + 1) % len(self.keys)
+                cand = self.keys[self.index]
+                if self._is_key_available(cand):
+                    found = cand
+                    break
+            # 如果没有找到任何可用key，返回None
+            if found is None:
+                return None
+            # 切换后延迟（调用方应在UI/逻辑中处理延迟）
+            time.sleep(KEY_SWITCH_DELAY)
+            return found
 
     def _is_key_available(self, key):
-        """检查Key是否可用：未冷却 + 未达使用上限"""
+        """检查Key是否可用：非永久无效+非平台不匹配+未冷却+未达使用上限"""
+        # 排除永久无效Key
+        if not key or key in self.permanent_invalid:
+            return False
+        # 排除平台不匹配Key
+        if key in self.plat_mismatch:
+            return False
         # 检查是否在冷却中
         if key in self.temp_cooldown:
             if time.time() < self.temp_cooldown[key]:
                 return False
             else:
-                # 冷却时间到，移除冷却标记，重置使用次数
+                # 冷却到期，移除冷却标记，重置使用次数与失败计数
                 del self.temp_cooldown[key]
                 self.usage_stats[key] = 0
+                self.failure_counts[key] = 0
         # 检查是否达到使用次数上限
         if self.usage_stats.get(key, 0) >= KEY_MAX_USAGE:
-            # 达到上限，自动进入冷却
-            self.mark_key_cooldown(key)
+            # 达到上限立即设置短期冷却
+            self._set_temp_cooldown_with_policy(key, reason="usage_limit")
             return False
         return True
 
-    def mark_key_cooldown(self, key):
-        """标记Key进入冷却期"""
-        if key in self.keys:
-            cool_down_end = time.time() + KEY_COOLDOWN_TIME
-            self.temp_cooldown[key] = cool_down_end
-            self.log(f"Key {key[:6]}... 达到使用上限({KEY_MAX_USAGE}次)或失效，进入冷却期({KEY_COOLDOWN_TIME}秒)", "WARNING")
-
     def mark_key_status(self, key, error_info):
-        """根据错误信息标记Key状态（只做冷却，不做永久失效）"""
-        if not key or key not in self.keys:
-            return
+        """根据错误类型标记Key状态并设置冷却"""
+        with self._lock:
+            if not key or key not in self.keys:
+                return
 
-        # 任何错误都标记为冷却（去掉永久无效逻辑）
-        self.mark_key_cooldown(key)
+            # 永久无效Key（10001）
+            if KEY_ERROR_PERMANENT in error_info:
+                self.permanent_invalid.add(key)
+                # 从列表中移除
+                if key in self.keys:
+                    try:
+                        self.keys.remove(key)
+                    except ValueError:
+                        pass
+                if key in self.usage_stats:
+                    del self.usage_stats[key]
+                if key in self.temp_cooldown:
+                    del self.temp_cooldown[key]
+                # 清理failure_counts, plat mismatch
+                if key in self.failure_counts:
+                    del self.failure_counts[key]
+                if key in self.plat_mismatch:
+                    self.plat_mismatch.discard(key)
+                # log via external (caller)
+                return
+
+            # 平台不匹配Key（10009）
+            if KEY_ERROR_PLAT_MISMATCH in error_info:
+                self.plat_mismatch.add(key)
+                return
+
+            # 对于临时日超限、QPS超限或其他临时异常，采用智能冷却策略
+            # 失败计数并根据计数决定冷却时长
+            self.failure_counts[key] += 1
+            count = self.failure_counts[key]
+            if count < 3:
+                # 短期冷却
+                cooldown = DEFAULT_SHORT_COOLDOWN
+            else:
+                # 连续失败 >=3 次，冷却到次日0点
+                cooldown = seconds_until_next_midnight()
+                # 重置计数到0
+                self.failure_counts[key] = 0
+
+            self.temp_cooldown[key] = time.time() + cooldown
+
+    def _set_temp_cooldown_with_policy(self, key, reason=""):
+        """内部通用冷却设置"""
+        if key not in self.keys:
+            return
+        # 如果之前已经失败过多次，延长到次日0点
+        if self.failure_counts.get(key, 0) >= 3:
+            cooldown = seconds_until_next_midnight()
+            self.failure_counts[key] = 0
+        else:
+            cooldown = DEFAULT_SHORT_COOLDOWN
+            self.failure_counts[key] = self.failure_counts.get(key, 0) + 1
+        self.temp_cooldown[key] = time.time() + cooldown
 
     def record_usage(self, key, count=1):
-        if key in self.usage_stats:
-            self.usage_stats[key] += count
-            # 检查是否达到使用上限
-            if self.usage_stats[key] >= KEY_MAX_USAGE:
-                self.mark_key_cooldown(key)
+        with self._lock:
+            if key in self.usage_stats and key not in self.permanent_invalid and key not in self.plat_mismatch:
+                self.usage_stats[key] += count
+                # 成功使用后重置连续失败计数
+                self.failure_counts[key] = 0
+                # 检查是否达到使用上限
+                if self.usage_stats[key] >= KEY_MAX_USAGE:
+                    self._set_temp_cooldown_with_policy(key, reason="usage_limit")
 
     def get_usage(self):
-        return dict(self.usage_stats)
+        with self._lock:
+            return dict(self.usage_stats)
 
     def get_key_status(self, key):
-        """获取Key的状态描述"""
-        if key in self.temp_cooldown:
-            remaining = int(self.temp_cooldown[key] - time.time())
+        """返回Key的详细状态描述"""
+        with self._lock:
+            if key in self.permanent_invalid:
+                return "永久无效（10001，已剔除）"
+            if key in self.plat_mismatch:
+                return "平台不匹配（10009，需修改类型）"
+            if key in self.temp_cooldown:
+                remaining = int(self.temp_cooldown[key] - time.time())
+                usage = self.usage_stats.get(key, 0)
+                # 如果剩余为负，清理
+                if remaining <= 0:
+                    del self.temp_cooldown[key]
+                    self.usage_stats[key] = 0
+                    self.failure_counts[key] = 0
+                    return self.get_key_status(key)
+                return f"临时冷却中（{remaining}s后恢复）- 已用{usage}/{KEY_MAX_USAGE}次"
             usage = self.usage_stats.get(key, 0)
-            return f"冷却中({remaining}s) - 已用{usage}/{KEY_MAX_USAGE}次"
-        usage = self.usage_stats.get(key, 0)
-        return f"正常可用 - 已用{usage}/{KEY_MAX_USAGE}次"
+            return f"正常可用 - 已用{usage}/{KEY_MAX_USAGE}次"
 
-    def log(self, msg, level="INFO"):
-        """内部日志（可对接主程序日志队列）"""
-        # 实际使用时会通过主程序的log_queue输出
-        pass
-
-
+# =======================================================================
+# 爬虫核心逻辑类
+# =======================================================================
 class AmapCrawlerLogic:
     def __init__(self, log_queue, stop_event, city_boundary_cache=None):
         self.log_queue = log_queue
         self.stop_event = stop_event
         self.converter = CoordinateConverter()
-        # 城市边界缓存 {citycode: {'polyline': '', 'bbox': '', 'update_time': ''}}
         self.city_boundary_cache = city_boundary_cache or {}
 
     def log(self, msg, level="INFO"):
@@ -197,7 +290,7 @@ class AmapCrawlerLogic:
         self.log_queue.put({"time": timestamp, "msg": msg, "level": level})
 
     def get_city_coords(self, key_manager, citycode, timeout=15):
-        """获取城市边界（优先使用缓存）"""
+        """获取城市边界"""
         # 1. 先检查缓存
         if citycode in self.city_boundary_cache:
             cache_data = self.city_boundary_cache[citycode]
@@ -212,17 +305,16 @@ class AmapCrawlerLogic:
                 self.log(f"城市 {citycode} 缓存数据不完整，重新获取", "WARNING")
 
         # 2. 缓存未命中或数据不完整，从API获取
-        max_attempts = len(key_manager.keys) * 2  # 最大重试次数=Key数量*2
+        max_attempts = max(1, len(key_manager.keys) * 2)
         tried = 0
         last_error = ""
 
         while tried < max_attempts and not self.stop_event.is_set():
             current_key = key_manager.get_current_key()
             if not current_key:
-                self.log("无可用的API Key", "ERROR")
+                self.log("无可用的API Key（在获取城市边界时）", "ERROR")
                 return None, None
 
-            # 日志显示Key状态
             key_status = key_manager.get_key_status(current_key)
             self.log(f"使用Key {current_key[:6]}... (状态: {key_status}) 获取城市 {citycode} 边界", "INFO")
 
@@ -250,31 +342,37 @@ class AmapCrawlerLogic:
                     bbox = f"{min(lons)},{max(lats)}|{max(lons)},{min(lats)}"
                     self.log(f"成功获取城市 {citycode} 边界，矩形范围: {bbox}", "SUCCESS")
 
-                    # 3. 缓存新获取的边界数据
+                    # 缓存
                     self.city_boundary_cache[citycode] = {
                         'polyline': polyline,
                         'bbox': bbox,
                         'update_time': datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     }
 
-                    time.sleep(REQUEST_INTERVAL)  # 正常请求后延迟
+                    time.sleep(REQUEST_INTERVAL)
                     return polyline, bbox
                 else:
                     info = data.get('info', '未知错误')
                     last_error = info
                     self.log(f"Key {current_key[:6]}... 请求城市边界失败: {info}", "WARNING")
-
-                    # 标记Key状态并切换
                     key_manager.mark_key_status(current_key, info)
-                    current_key = key_manager.switch_key()
-                    time.sleep(KEY_SWITCH_DELAY)  # 切换Key后延迟
+                    # 尝试切换key
+                    nxt = key_manager.switch_key()
+                    if not nxt:
+                        # 没有可用Key
+                        self.log("检测到无可用Key（在 get_city_coords 中）", "ERROR")
+                        return None, None
+                    time.sleep(KEY_SWITCH_DELAY)
 
             except Exception as e:
                 last_error = str(e)
                 self.log(f"网络请求异常 (get_city_coords): {e}", "ERROR")
-                # 切换Key并延迟
-                key_manager.switch_key()
-                time.sleep(ERROR_DELAY)  # 异常后延迟
+                key_manager.mark_key_status(current_key, str(e))
+                nxt = key_manager.switch_key()
+                if not nxt:
+                    self.log("检测到无可用Key（在 get_city_coords 异常处理后）", "ERROR")
+                    return None, None
+                time.sleep(ERROR_DELAY)
 
             tried += 1
 
@@ -282,44 +380,43 @@ class AmapCrawlerLogic:
         return None, None
 
     def generate_grids(self, polyline_coords, bbox, grid_size):
-        """"""
         if not bbox or not polyline_coords:
             self.log("bbox或城市边界坐标为空，无法生成网格", "WARNING")
             return []
 
-        # ========== 核心修复：正确解析bbox ==========
         try:
-            # bbox格式：min_lng,max_lat|max_lng,min_lat（从get_city_coords函数生成）
             part1, part2 = bbox.split('|')
             min_lng_str, max_lat_str = part1.split(',')
             max_lng_str, min_lat_str = part2.split(',')
 
-            # 转换为浮点数
             min_lng = float(min_lng_str)
+            max_lat = float(max_lat_str)
+            min_lat = float(min_lat_str)
+            max_lat = float(max_lng_str)  
+            max_lat = float(max_lat_str)
             max_lng = float(max_lng_str)
             min_lat = float(min_lat_str)
-            max_lat = float(max_lat_str)
-
-            # 日志输出解析结果（调试用）
-            self.log(f"网格生成参数：min_lng={min_lng:.6f}, max_lng={max_lng:.6f}, "
-                     f"min_lat={min_lat:.6f}, max_lat={max_lat:.6f}, grid_size={grid_size}", "INFO")
-
-            # 检查坐标合理性
-            if max_lng - min_lng < FLOAT_EPS or max_lat - min_lat < FLOAT_EPS:
-                self.log(f"城市边界范围过小（经度跨度：{max_lng - min_lng:.6f}，纬度跨度：{max_lat - min_lat:.6f}）", "WARNING")
+        except Exception as e:
+            
+            try:
+                part1, part2 = bbox.split('|')
+                min_lng_str, max_lat_str = part1.split(',')
+                max_lng_str, min_lat_str = part2.split(',')
+                min_lng = float(min_lng_str)
+                max_lat = float(max_lat_str)
+                max_lng = float(max_lng_str)
+                min_lat = float(min_lat_str)
+            except Exception as e2:
+                self.log(f"解析bbox失败：{e2}，bbox格式应为'min_lng,max_lat|max_lng,min_lat'", "ERROR")
                 return []
 
-            # 确保min/max正确
-            if min_lng > max_lng:
-                min_lng, max_lng = max_lng, min_lng
-            if min_lat > max_lat:
-                min_lat, max_lat = max_lat, min_lat
+        # 确保顺序正确
+        if min_lng > max_lng:
+            min_lng, max_lng = max_lng, min_lng
+        if min_lat > max_lat:
+            min_lat, max_lat = max_lat, min_lat
 
-        except Exception as e:
-            self.log(f"解析bbox失败：{e}，bbox格式应为'min_lng,max_lat|max_lng,min_lat'", "ERROR")
-            return []
-
-        # ========== 处理城市边界多边形 ==========
+        # 解析多边形
         polygons_geo = []
         for poly_str in polyline_coords.split('|'):
             points = []
@@ -334,7 +431,7 @@ class AmapCrawlerLogic:
             if len(points) >= 3:
                 polygons_geo.append(Polygon(points))
             else:
-                self.log(f"跳过无效多边形（少于3个点）：{poly_str}", "WARNING")
+                self.log(f"跳过无效多边形（少于3个点）", "WARNING")
 
         if not polygons_geo:
             self.log("未解析到有效城市边界多边形，无法生成网格", "ERROR")
@@ -342,55 +439,93 @@ class AmapCrawlerLogic:
 
         admin_geo = MultiPolygon(polygons_geo) if len(polygons_geo) > 1 else polygons_geo[0]
 
-        # ========== 生成网格并筛选相交部分 ==========
         grids = []
         curr_lng = min_lng
-        lng_count = 0  # 统计经度方向网格数
-        lat_count = 0  # 统计纬度方向网格数
+        lng_count = 0
+        lat_count = 0
 
-        # 经度循环
         while curr_lng < max_lng + FLOAT_EPS:
             curr_lat = max_lat
             lat_count = 0
-            # 纬度循环
             while curr_lat > min_lat - FLOAT_EPS:
-                # 计算网格四角坐标
                 lng1 = curr_lng
                 lng2 = curr_lng + grid_size
                 lat1 = curr_lat
                 lat2 = curr_lat - grid_size
-
-                # 构建网格多边形
                 grid_poly = Polygon([(lng1, lat1), (lng2, lat1), (lng2, lat2), (lng1, lat2)])
-
-                # 筛选与城市边界相交的网格
                 if grid_poly.intersects(admin_geo):
                     grids.append(f"{lng1:.6f},{lat1:.6f}|{lng2:.6f},{lat2:.6f}")
-
-                # 纬度步长
                 curr_lat = round(curr_lat - grid_size, 6)
                 lat_count += 1
-
-            # 经度步长
             curr_lng = round(curr_lng + grid_size, 6)
             lng_count += 1
 
-        # 日志输出网格生成结果
         self.log(f"生成网格统计：经度方向{lng_count}个，纬度方向{lat_count}个，有效相交网格{len(grids)}个", "INFO")
-
         return grids
 
-    def fetch_pois(self, key_manager, type_code, grid_polygon, timeout=15):
-        """获取POI数据"""
+    def _get_poi_total_count(self, key_manager, type_code, grid_polygon, timeout):
         current_key = key_manager.get_current_key()
         if not current_key:
-            self.log("无可用的API Key", "ERROR")
-            return []
+            return -1, 0
+
+        params = {
+            'key': current_key,
+            'polygon': grid_polygon,
+            'types': type_code,
+            'offset': 20,
+            'page': 1,
+            'extensions': 'all'
+        }
+
+        max_attempts = max(1, len(key_manager.keys))
+        for attempt in range(max_attempts):
+            try:
+                resp = requests.get('https://restapi.amap.com/v3/place/polygon', params=params, timeout=timeout)
+                data = resp.json()
+
+                if data.get('status') == '0':
+                    info = data.get('info', '未知错误')
+                    self.log(f"获取POI总数失败: {info} (key {current_key[:6]}...)", "WARNING")
+                    key_manager.mark_key_status(current_key, info)
+                    nxt = key_manager.switch_key()
+                    if not nxt:
+                        self.log("检测到无可用Key（在 _get_poi_total_count 中）", "ERROR")
+                        return -1, 0
+                    params['key'] = nxt
+                    current_key = nxt
+                    time.sleep(KEY_SWITCH_DELAY)
+                    continue
+
+                total_count = int(data.get('count', 0))
+                page_count = (total_count + 19) // 20
+                return total_count, page_count
+
+            except Exception as e:
+                self.log(f"获取POI总数异常: {e}", "ERROR")
+                key_manager.mark_key_status(current_key, str(e))
+                nxt = key_manager.switch_key()
+                if not nxt:
+                    self.log("检测到无可用Key（在 _get_poi_total_count 异常处理后）", "ERROR")
+                    return -1, 0
+                params['key'] = nxt
+                current_key = nxt
+                time.sleep(ERROR_DELAY)
+
+        return -1, 0
+
+    def fetch_pois(self, key_manager, type_code, grid_polygon, timeout=15):
+        """获取POI数据（分页）"""
+        # 如果没有任何可用Key，直接返回特殊标记
+        if not key_manager.any_available_keys():
+            return None  # 特殊返回值表示“无可用Key”
+
+        current_key = key_manager.get_current_key()
+        if not current_key:
+            return None
 
         base_url = 'https://restapi.amap.com/v3/place/polygon'
         all_pois = []
 
-        # 第一步：获取POI总数
         total_count, page_count = self._get_poi_total_count(key_manager, type_code, grid_polygon, timeout)
         if total_count == 0:
             return []
@@ -400,14 +535,18 @@ class AmapCrawlerLogic:
 
         self.log(f"当前网格预计有 {total_count} 个POI，共 {page_count} 页", "INFO")
 
-        # 第二步：分页获取POI
         for page in range(1, page_count + 1):
             if self.stop_event.is_set():
                 break
 
-            # 检查当前Key是否可用
+            if not key_manager.any_available_keys():
+                return None
+
             if not key_manager._is_key_available(current_key):
-                current_key = key_manager.switch_key()
+                nxt = key_manager.switch_key()
+                if not nxt:
+                    return None
+                current_key = nxt
                 self.log(f"切换到Key {current_key[:6]}... 继续获取第 {page} 页", "INFO")
 
             params = {
@@ -427,10 +566,11 @@ class AmapCrawlerLogic:
                 if data.get('status') == '0':
                     info = data.get('info', '未知错误')
                     self.log(f"API错误 [{info}] (key {current_key[:6]}...)", "WARNING")
-
-                    # 标记Key状态并切换
                     key_manager.mark_key_status(current_key, info)
-                    current_key = key_manager.switch_key()
+                    nxt = key_manager.switch_key()
+                    if not nxt:
+                        return None
+                    current_key = nxt
                     continue
 
                 pois = data.get('pois', [])
@@ -439,7 +579,6 @@ class AmapCrawlerLogic:
                     time.sleep(REQUEST_INTERVAL)
                     continue
 
-                # 处理POI数据
                 for p in pois:
                     res = {
                         "poi_id": p.get('id'),
@@ -468,66 +607,23 @@ class AmapCrawlerLogic:
                     key_manager.record_usage(current_key)
 
                 self.log(f"第 {page} 页获取成功，新增 {len(pois)} 个POI", "SUCCESS")
-                time.sleep(REQUEST_INTERVAL)  # 分页请求延迟
+                time.sleep(REQUEST_INTERVAL)
 
             except Exception as e:
                 self.log(f"第 {page} 页请求异常：{e}", "ERROR")
-                # 切换Key并延迟
                 key_manager.mark_key_status(current_key, str(e))
-                current_key = key_manager.switch_key()
+                nxt = key_manager.switch_key()
+                if not nxt:
+                    return None
+                current_key = nxt
                 time.sleep(ERROR_DELAY)
                 continue
 
         return all_pois
 
-    def _get_poi_total_count(self, key_manager, type_code, grid_polygon, timeout):
-        """获取POI总数和总页数"""
-        current_key = key_manager.get_current_key()
-        if not current_key:
-            return -1
-
-        params = {
-            'key': current_key,
-            'polygon': grid_polygon,
-            'types': type_code,
-            'offset': 20,
-            'page': 1,
-            'extensions': 'all'
-        }
-
-        max_attempts = len(key_manager.keys)
-        for attempt in range(max_attempts):
-            try:
-                resp = requests.get('https://restapi.amap.com/v3/place/polygon', params=params, timeout=timeout)
-                data = resp.json()
-
-                if data.get('status') == '0':
-                    info = data.get('info', '未知错误')
-                    self.log(f"获取POI总数失败: {info} (key {current_key[:6]}...)", "WARNING")
-
-                    # 标记Key状态并切换
-                    key_manager.mark_key_status(current_key, info)
-                    current_key = key_manager.switch_key()
-                    params['key'] = current_key
-                    time.sleep(KEY_SWITCH_DELAY)
-                    continue
-
-                total_count = int(data.get('count', 0))
-                page_count = (total_count + 19) // 20  # 向上取整
-                return total_count, page_count
-
-            except Exception as e:
-                self.log(f"获取POI总数异常: {e}", "ERROR")
-                key_manager.switch_key()
-                time.sleep(ERROR_DELAY)
-
-        return -1, 0
-
-
-# ==============================================================================
-# GUI 主程序
-# ==============================================================================
-
+# =======================================================================
+# GUI 主程序（含断点/拖拽/右键/复制等交互）
+# =======================================================================
 class POICrawlerApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -543,27 +639,30 @@ class POICrawlerApp(tk.Tk):
         self.auto_rotate_var = tk.BooleanVar(value=True)
         self.settings_file_var = tk.StringVar(value=DEFAULT_SETTINGS_FILE)
 
-        # 城市边界缓存（新增）
+        # 城市边界缓存
         self.city_boundary_cache = {}
 
         # 后台控制
         self.log_queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.pause_event = threading.Event()   # 当断点暂停时设置
+        self.resume_event = threading.Event()  # 用户点击继续时
         self.is_running = False
         self.worker_thread = None
         self.key_manager = KeyManager([], auto_rotate=True)
 
-        # 构建界面
+        # 断点信息结构
+        self.breakpoint = None  # None or dict with checkpoint info
+
+        # UI
         self.create_widgets()
         self.load_settings()
         self.process_log_queue()
 
     def create_widgets(self):
-        # 主容器
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 顶部 Tab 区域
         nb = ttk.Notebook(main_frame)
         nb.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
 
@@ -571,35 +670,29 @@ class POICrawlerApp(tk.Tk):
         setting_tab = ttk.Frame(nb, padding=10)
         nb.add(setting_tab, text='任务设置')
 
-        # --- 区块 1: 采集参数 ---
+        # 参数区
         param_frame = ttk.LabelFrame(setting_tab, text='1. 采集参数', padding=10)
         param_frame.pack(fill=tk.X, pady=5)
 
-        # POI类型
         ttk.Label(param_frame, text="POI 类型编码:").grid(row=0, column=0, sticky='w')
-        ttk.Entry(param_frame, textvariable=self.type_var).grid(row=0, column=1, columnspan=1, sticky='ew', padx=5,
-                                                                pady=2)
+        ttk.Entry(param_frame, textvariable=self.type_var).grid(row=0, column=1, sticky='ew', padx=5, pady=2)
         ttk.Label(param_frame, text="(例如: 010100, 多个用逗号分隔)", foreground="gray").grid(row=0, column=3, sticky='w')
 
-        # 城市编码
         ttk.Label(param_frame, text="城市编码:").grid(row=1, column=0, sticky='w')
         ttk.Entry(param_frame, textvariable=self.city_var).grid(row=1, column=1, sticky='ew', padx=5, pady=2)
         ttk.Button(param_frame, text="清除", command=self.clear_city_input, width=8).grid(row=1, column=2, padx=2)
-        ttk.Label(param_frame, text="(Adcode, 例如: 110000, 多个用逗号分隔)", foreground="gray").grid(row=1, column=3,
-                                                                                             sticky='w')
+        ttk.Label(param_frame, text="(Adcode, 例如: 110000, 多个用逗号分隔)", foreground="gray").grid(row=1, column=3, sticky='w')
 
-        # 网格大小
         ttk.Label(param_frame, text="网格大小(度):").grid(row=2, column=0, sticky='w')
         ttk.Entry(param_frame, textvariable=self.grid_var, width=15).grid(row=2, column=1, sticky='w', padx=5, pady=2)
         ttk.Label(param_frame, text="(建议 0.02~0.1 之间)", foreground="gray").grid(row=2, column=3, sticky='w')
 
         param_frame.columnconfigure(1, weight=1)
 
-        # --- 区块 2: 文件与配置 ---
+        # 文件区
         file_frame = ttk.LabelFrame(setting_tab, text='2. 文件与配置管理', padding=10)
         file_frame.pack(fill=tk.X, pady=5)
 
-        # 输出目录
         ttk.Label(file_frame, text="输出数据目录:").grid(row=0, column=0, sticky='w')
         ttk.Entry(file_frame, textvariable=self.output_path_var).grid(row=0, column=1, sticky='ew', padx=5)
         bbox_out = ttk.Frame(file_frame)
@@ -607,7 +700,6 @@ class POICrawlerApp(tk.Tk):
         ttk.Button(bbox_out, text='浏览', command=self.browse_output_folder, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(bbox_out, text='打开目录', command=self.open_output_folder, width=8).pack(side=tk.LEFT, padx=2)
 
-        # 配置文件路径
         ttk.Label(file_frame, text="配置文件路径:").grid(row=1, column=0, sticky='w')
         ttk.Entry(file_frame, textvariable=self.settings_file_var).grid(row=1, column=1, sticky='ew', padx=5)
         bbox_conf = ttk.Frame(file_frame)
@@ -615,14 +707,12 @@ class POICrawlerApp(tk.Tk):
         ttk.Button(bbox_conf, text='浏览', command=self.choose_settings_file, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(bbox_conf, text='默认', command=self.reset_settings_path, width=8).pack(side=tk.LEFT, padx=2)
 
-        # 配置文件操作按钮栏
         action_bar = ttk.Frame(file_frame)
         action_bar.grid(row=2, column=1, sticky='w', pady=5, padx=5)
         ttk.Button(action_bar, text='加载配置', command=self.load_settings, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(action_bar, text='保存配置', command=self.save_settings, width=8).pack(side=tk.LEFT, padx=2)
         ttk.Button(action_bar, text='另存为', command=self.export_settings_as, width=8).pack(side=tk.LEFT, padx=2)
 
-        # 新增：缓存管理按钮
         cache_bar = ttk.Frame(file_frame)
         cache_bar.grid(row=2, column=2, sticky='w', pady=5, padx=5)
         ttk.Button(cache_bar, text='查看缓存', command=self.view_city_cache, width=9).pack(side=tk.LEFT, padx=2)
@@ -630,7 +720,7 @@ class POICrawlerApp(tk.Tk):
 
         file_frame.columnconfigure(1, weight=1)
 
-        # --- 区块 3: 运行控制 ---
+        # 运行控制
         ctrl_frame = ttk.Frame(setting_tab, padding=10)
         ctrl_frame.pack(fill=tk.X, pady=5)
 
@@ -640,13 +730,14 @@ class POICrawlerApp(tk.Tk):
         self.btn_stop = ttk.Button(ctrl_frame, text='⏹ 停止任务', command=self.stop_task, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=5, ipady=5, ipadx=10)
 
+        self.btn_resume = ttk.Button(ctrl_frame, text='▶ 从断点继续', command=self.resume_from_breakpoint, state=tk.DISABLED)
+        self.btn_resume.pack(side=tk.LEFT, padx=5, ipady=5, ipadx=10)
+
         ttk.Checkbutton(ctrl_frame, text='API Key 自动轮换', variable=self.auto_rotate_var).pack(side=tk.LEFT, padx=15)
 
-        # 新增：Key使用限制提示
-        ttk.Label(ctrl_frame, text=f"Key使用限制：{KEY_MAX_USAGE}次/冷却期({KEY_COOLDOWN_TIME}秒)", foreground="blue").pack(
-            side=tk.RIGHT, padx=5)
+        ttk.Label(ctrl_frame, text=f"Key使用限制：{KEY_MAX_USAGE}次/短冷却({DEFAULT_SHORT_COOLDOWN}s)", foreground="blue").pack(side=tk.RIGHT, padx=5)
 
-        # ====== 日志区域 ======
+        # 日志区
         log_lf = ttk.LabelFrame(setting_tab, text='运行日志', padding=5)
         log_lf.pack(fill=tk.BOTH, expand=True, pady=(6, 10))
 
@@ -657,56 +748,71 @@ class POICrawlerApp(tk.Tk):
         log_scr.pack(side='right', fill='y')
         self.txt_log.configure(yscrollcommand=log_scr.set)
 
-        # 日志颜色配置
         self.txt_log.tag_config('INFO', foreground='black')
         self.txt_log.tag_config('SUCCESS', foreground='green')
-        self.txt_log.tag_config('WARNING', foreground='#FF8C00')  # DarkOrange
+        self.txt_log.tag_config('WARNING', foreground='#FF8C00')
         self.txt_log.tag_config('ERROR', foreground='red')
 
         # ============= Tab 2: API Key 管理 =============
         keys_frame = ttk.Frame(nb, padding=10)
         nb.add(keys_frame, text='API Key 管理')
 
-        # 左侧列表
-        left_pane = ttk.Frame(keys_frame)
-        left_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # 使用 tk.PanedWindow 支持 paneconfig(minsize=...)
+        paned_window = tk.PanedWindow(keys_frame, orient=tk.HORIZONTAL)
+        paned_window.pack(fill=tk.BOTH, expand=True)
 
-        lbl_keys = tk.Label(left_pane, text=f"Key 列表 (使用限制：{KEY_MAX_USAGE}次/冷却期)")
+        # 左侧窗格（Key 列表）
+        left_pane = ttk.Frame(paned_window)
+        paned_window.add(left_pane) 
+
+        # 设置左侧最小宽度
+        paned_window.paneconfig(left_pane, minsize=300)
+
+        lbl_keys = tk.Label(left_pane, text=f"Key 列表 (支持拖拽重排/右键粘贴/双击编辑)")
         lbl_keys.pack(anchor='w')
 
-        self.lb_keys = tk.Listbox(left_pane, height=15)
+        self.lb_keys = tk.Listbox(left_pane, height=18)
         self.lb_keys.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scr = ttk.Scrollbar(left_pane, orient='vertical', command=self.lb_keys.yview)
         scr.pack(side=tk.RIGHT, fill=tk.Y)
         self.lb_keys.configure(yscrollcommand=scr.set)
-        self.lb_keys.bind('<Double-Button-1>', self.on_key_double_click)
 
-        # 右侧操作
-        right_pane = ttk.Frame(keys_frame, padding=(10, 0))
-        right_pane.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False)
+        # 绑定拖拽、双击、右键
+        self.lb_keys.bind('<Double-Button-1>', self.on_key_double_click_edit)
+        self.lb_keys.bind('<ButtonPress-1>', self._on_listbox_button_press)
+        self.lb_keys.bind('<B1-Motion>', self._on_listbox_motion)
+        self.lb_keys.bind('<ButtonRelease-1>', self._on_listbox_release)
+        self.lb_keys.bind('<Button-3>', self._on_keylist_right_click)  # Windows/Linux 右键
+
+        # 右侧窗格（操作区）
+        right_pane = ttk.Frame(paned_window, padding=(10, 0))
+        paned_window.add(right_pane)
 
         ttk.Label(right_pane, text="输入 Key:").pack(anchor='w')
-        self.key_entry = ttk.Entry(right_pane, textvariable=self.key_var, width=35)
+        self.key_entry = ttk.Entry(right_pane, textvariable=self.key_var, width=45)
         self.key_entry.pack(pady=5)
 
         ttk.Button(right_pane, text='添加 / 更新', command=self.add_key).pack(fill=tk.X, pady=2)
         ttk.Button(right_pane, text='删除选中', command=self.remove_selected_key).pack(fill=tk.X, pady=2)
         ttk.Separator(right_pane, orient='horizontal').pack(fill=tk.X, pady=8)
         ttk.Button(right_pane, text='从文件导入...', command=self.import_keys).pack(fill=tk.X, pady=2)
-        ttk.Button(right_pane, text='测试选中 Key', command=self.test_selected_key).pack(fill=tk.X, pady=2)
+        ttk.Button(right_pane, text='测试选中 Key（双接口）', command=self.test_selected_key).pack(fill=tk.X, pady=2)
+        ttk.Button(right_pane, text='上移', command=self.move_selected_key_up).pack(fill=tk.X, pady=2)
+        ttk.Button(right_pane, text='下移', command=self.move_selected_key_down).pack(fill=tk.X, pady=2)
 
-        # 统计区
-        stat_frame = ttk.LabelFrame(right_pane, text="当前会话使用统计", padding=5)
+        stat_frame = ttk.LabelFrame(right_pane, text="当前会话使用统计（含详细状态）", padding=5)
         stat_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
         self.tree_stats = ttk.Treeview(stat_frame, columns=('key', 'count', 'status'), show='headings', height=8)
         self.tree_stats.heading('key', text='Key (前缀)')
         self.tree_stats.heading('count', text='使用次数')
         self.tree_stats.heading('status', text='当前状态')
-        self.tree_stats.column('key', width=120)
+        self.tree_stats.column('key', width=140)
         self.tree_stats.column('count', width=80)
-        self.tree_stats.column('status', width=150)  # 加宽状态列
+        self.tree_stats.column('status', width=260)
         self.tree_stats.pack(fill=tk.BOTH, expand=True)
+
+        self.tree_stats.bind('<Button-3>', self._on_stats_right_click)
 
         ttk.Button(stat_frame, text='刷新统计', command=self.refresh_key_stats).pack(fill=tk.X, pady=2)
 
@@ -716,13 +822,15 @@ class POICrawlerApp(tk.Tk):
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(prog_frame, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.lbl_status = ttk.Label(prog_frame, text='就绪', width=30, anchor='e')
+        self.lbl_status = ttk.Label(prog_frame, text='就绪', width=40, anchor='e')
         self.lbl_status.pack(side=tk.RIGHT, padx=5)
 
-        # 全局快捷键
         self.bind_all('<Control-s>', lambda e: self.save_settings())
 
-    # ================= 配置文件管理逻辑（新增城市缓存） =================
+        # internal drag state
+        self._drag_start_index = None
+
+    # ================= 配置/缓存管理 =================
     def get_settings_file(self):
         path = self.settings_file_var.get().strip()
         return path if path else DEFAULT_SETTINGS_FILE
@@ -743,11 +851,8 @@ class POICrawlerApp(tk.Tk):
         messagebox.showinfo('提示', '已恢复为默认配置文件路径')
 
     def export_settings_as(self):
-        path = filedialog.asksaveasfilename(
-            title="另存为配置",
-            defaultextension='.json',
-            filetypes=[('JSON files', '*.json')]
-        )
+        path = filedialog.asksaveasfilename(title="另存为配置", defaultextension='.json',
+                                            filetypes=[('JSON files', '*.json')])
         if not path:
             return
         self._save_to_file(path)
@@ -758,7 +863,6 @@ class POICrawlerApp(tk.Tk):
         if not os.path.exists(current_path):
             messagebox.showwarning('提示', '当前配置文件不存在，无法备份')
             return
-
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         backup_path = f"{current_path}.{ts}.bak"
         try:
@@ -780,7 +884,7 @@ class POICrawlerApp(tk.Tk):
             'grid': self.grid_var.get(),
             'output': self.output_path_var.get(),
             'auto_rotate': self.auto_rotate_var.get(),
-            'city_boundary_cache': self.city_boundary_cache  # 新增：保存城市边界缓存
+            'city_boundary_cache': self.city_boundary_cache
         }
         try:
             os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
@@ -798,35 +902,27 @@ class POICrawlerApp(tk.Tk):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-
             self.set_keys(data.get('keys', []))
             self.type_var.set(data.get('type', ''))
             self.city_var.set(data.get('cities', ''))
             self.grid_var.set(data.get('grid', 0.1))
             self.output_path_var.set(data.get('output', self.output_path_var.get()))
             self.auto_rotate_var.set(data.get('auto_rotate', True))
-            # 新增：加载城市边界缓存
             self.city_boundary_cache = data.get('city_boundary_cache', {})
-
             self.log_queue.put({'msg': f'成功加载配置: {path}', 'level': 'SUCCESS'})
             self.log_queue.put({'msg': f'加载城市边界缓存 {len(self.city_boundary_cache)} 条', 'level': 'INFO'})
         except Exception as e:
             self.log_queue.put({'msg': f'加载配置异常: {e}', 'level': 'ERROR'})
             messagebox.showerror("加载失败", f"无法读取配置文件:\n{e}")
 
-    # ================= 城市缓存管理（新增） =================
+    # ================= 城市缓存查看/管理 =================
     def view_city_cache(self):
-        """查看城市边界缓存"""
         if not self.city_boundary_cache:
             messagebox.showinfo('提示', '暂无城市边界缓存数据')
             return
-
-        # 创建缓存查看窗口
         cache_win = tk.Toplevel(self)
         cache_win.title('城市边界缓存')
         cache_win.geometry('600x400')
-
-        # 创建表格
         tree = ttk.Treeview(cache_win, columns=('citycode', 'update_time', 'bbox'), show='headings')
         tree.heading('citycode', text='城市编码')
         tree.heading('update_time', text='缓存时间')
@@ -834,23 +930,13 @@ class POICrawlerApp(tk.Tk):
         tree.column('citycode', width=100)
         tree.column('update_time', width=180)
         tree.column('bbox', width=300)
-
-        # 填充数据
         for citycode, cache_data in self.city_boundary_cache.items():
-            tree.insert('', 'end', values=(
-                citycode,
-                cache_data.get('update_time', '未知'),
-                cache_data.get('bbox', '无')
-            ))
-
-        # 滚动条
+            tree.insert('', 'end', values=(citycode, cache_data.get('update_time', '未知'), cache_data.get('bbox', '无')))
         scrollbar = ttk.Scrollbar(cache_win, orient='vertical', command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
-
         tree.pack(side='left', fill='both', expand=True)
         scrollbar.pack(side='right', fill='y')
 
-        # 清除选中缓存按钮
         def delete_selected():
             selected = tree.selection()
             if not selected:
@@ -861,17 +947,15 @@ class POICrawlerApp(tk.Tk):
                     del self.city_boundary_cache[citycode]
                 tree.delete(item)
             messagebox.showinfo('提示', '选中缓存已删除')
-
         ttk.Button(cache_win, text='删除选中缓存', command=delete_selected).pack(fill='x', pady=5)
 
     def clear_city_cache(self):
-        """清除所有城市边界缓存"""
         if messagebox.askyesno('确认', '确定要清除所有城市边界缓存吗？'):
             self.city_boundary_cache.clear()
             self.log_queue.put({'msg': '已清除所有城市边界缓存', 'level': 'INFO'})
             messagebox.showinfo('提示', '所有城市边界缓存已清除')
 
-    # ================= 其他辅助功能 =================
+    # ================= 其他辅助 =================
     def clear_city_input(self):
         self.city_var.set('')
 
@@ -885,38 +969,41 @@ class POICrawlerApp(tk.Tk):
         if not os.path.exists(path):
             messagebox.showwarning('提示', '目录不存在，请先开始任务或手动创建')
             return
-
         try:
             system_name = platform.system()
             if system_name == 'Windows':
                 os.startfile(path)
-            elif system_name == 'Darwin':  # macOS
+            elif system_name == 'Darwin':
                 subprocess.call(['open', path])
-            else:  # Linux
+            else:
                 subprocess.call(['xdg-open', path])
         except Exception as e:
             messagebox.showerror('错误', f'无法打开目录: {e}')
 
-    # ================= Key 管理（修改状态显示） =================
+    # ================= Key 管理 UI + 操作 =================
     def get_keys(self):
         return [self.lb_keys.get(i) for i in range(self.lb_keys.size())]
 
     def set_keys(self, keys):
         self.lb_keys.delete(0, tk.END)
-        for k in keys:
+        valid_keys = [k for k in keys if k not in self.key_manager.permanent_invalid]
+        for k in valid_keys:
             self.lb_keys.insert(tk.END, k)
-        self.key_manager.set_keys(keys)
+        self.key_manager.set_keys(valid_keys)
         self.refresh_key_stats()
 
     def add_key(self):
         k = self.key_var.get().strip()
         if not k:
             return
-
+        if k in self.key_manager.permanent_invalid:
+            messagebox.showwarning('提示', '该Key为永久无效Key，无法添加')
+            return
         sel = self.lb_keys.curselection()
         if sel:
-            self.lb_keys.delete(sel[0])
-            self.lb_keys.insert(sel[0], k)
+            idx = sel[0]
+            self.lb_keys.delete(idx)
+            self.lb_keys.insert(idx, k)
         else:
             self.lb_keys.insert(tk.END, k)
         self.key_var.set('')
@@ -930,11 +1017,14 @@ class POICrawlerApp(tk.Tk):
         for i in reversed(sel):
             removed_key = self.lb_keys.get(i)
             self.lb_keys.delete(i)
-            # 从KeyManager中移除相关记录
             if removed_key in self.key_manager.usage_stats:
                 del self.key_manager.usage_stats[removed_key]
             if removed_key in self.key_manager.temp_cooldown:
                 del self.key_manager.temp_cooldown[removed_key]
+            if removed_key in self.key_manager.plat_mismatch:
+                self.key_manager.plat_mismatch.discard(removed_key)
+            if removed_key in self.key_manager.failure_counts:
+                del self.key_manager.failure_counts[removed_key]
         self.key_manager.set_keys(self.get_keys())
         self.refresh_key_stats()
 
@@ -945,12 +1035,13 @@ class POICrawlerApp(tk.Tk):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 text = f.read()
-            keys = [k.strip() for k in text.replace('\n', ',').split(',') if k.strip()]
-            for k in keys:
+            valid_keys = [k.strip() for k in text.replace('\n', ',').split(',') if k.strip() and k not in self.key_manager.permanent_invalid]
+            for k in valid_keys:
                 self.lb_keys.insert(tk.END, k)
-            self.key_manager.set_keys(keys)
+            # update key manager with full current list
+            self.key_manager.set_keys(self.get_keys())
             self.refresh_key_stats()
-            messagebox.showinfo('提示', f'导入了 {len(keys)} 个Key')
+            messagebox.showinfo('提示', f'导入了 {len(valid_keys)} 个有效Key（已过滤永久无效Key）')
         except Exception as e:
             messagebox.showerror('错误', str(e))
 
@@ -959,6 +1050,146 @@ class POICrawlerApp(tk.Tk):
         if sel:
             self.key_var.set(self.lb_keys.get(sel[0]))
 
+    # 双击打开编辑弹窗
+    def on_key_double_click_edit(self, event=None):
+        sel = self.lb_keys.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        original = self.lb_keys.get(idx)
+        new_val = simpledialog.askstring("编辑 Key", "修改 Key:", initialvalue=original, parent=self)
+        if new_val and new_val.strip():
+            self.lb_keys.delete(idx)
+            self.lb_keys.insert(idx, new_val.strip())
+            self.key_manager.set_keys(self.get_keys())
+            self.refresh_key_stats()
+
+    # 拖拽实现（鼠标按下记录起始索引）
+    def _on_listbox_button_press(self, event):
+        try:
+            idx = self.lb_keys.nearest(event.y)
+            self._drag_start_index = idx
+        except Exception:
+            self._drag_start_index = None
+
+    def _on_listbox_motion(self, event):
+        if self._drag_start_index is None:
+            return
+        try:
+            i = self.lb_keys.nearest(event.y)
+            if i != self._drag_start_index:
+                # 交换显示
+                val = self.lb_keys.get(self._drag_start_index)
+                self.lb_keys.delete(self._drag_start_index)
+                self.lb_keys.insert(i, val)
+                # 更新起点为当前
+                self._drag_start_index = i
+        except Exception:
+            pass
+
+    def _on_listbox_release(self, event):
+        # 完成拖拽后更新 KeyManager 顺序
+        if self._drag_start_index is not None:
+            self.key_manager.set_keys(self.get_keys())
+            self.refresh_key_stats()
+        self._drag_start_index = None
+
+    def move_selected_key_up(self):
+        sel = self.lb_keys.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx == 0:
+            return
+        val = self.lb_keys.get(idx)
+        self.lb_keys.delete(idx)
+        self.lb_keys.insert(idx - 1, val)
+        self.lb_keys.selection_clear(0, tk.END)
+        self.lb_keys.selection_set(idx - 1)
+        self.key_manager.set_keys(self.get_keys())
+        self.refresh_key_stats()
+
+    def move_selected_key_down(self):
+        sel = self.lb_keys.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx == self.lb_keys.size() - 1:
+            return
+        val = self.lb_keys.get(idx)
+        self.lb_keys.delete(idx)
+        self.lb_keys.insert(idx + 1, val)
+        self.lb_keys.selection_clear(0, tk.END)
+        self.lb_keys.selection_set(idx + 1)
+        self.key_manager.set_keys(self.get_keys())
+        self.refresh_key_stats()
+
+    # 右键菜单（Key 列表）
+    def _on_keylist_right_click(self, event):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="粘贴插入", command=lambda: self._paste_into_keylist(event))
+        menu.add_command(label="删除选中", command=self.remove_selected_key)
+        menu.add_command(label="编辑选中", command=self._menu_edit_selected)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _paste_into_keylist(self, event=None):
+        try:
+            text = self.clipboard_get()
+        except Exception:
+            text = ''
+        if not text:
+            messagebox.showinfo('提示', '剪贴板为空或不可用')
+            return
+        parts = [p.strip() for p in text.replace('\n', ',').split(',') if p.strip()]
+        insert_idx = self.lb_keys.nearest(event.y) if event else tk.END
+        # 如果没有选中则追加
+        if insert_idx == tk.END:
+            for p in parts:
+                self.lb_keys.insert(tk.END, p)
+        else:
+            try:
+                # 在鼠标点附近插入
+                idx = insert_idx
+                for p in parts:
+                    self.lb_keys.insert(idx, p)
+                    idx += 1
+            except Exception:
+                for p in parts:
+                    self.lb_keys.insert(tk.END, p)
+        self.key_manager.set_keys(self.get_keys())
+        self.refresh_key_stats()
+
+    def _menu_edit_selected(self):
+        sel = self.lb_keys.curselection()
+        if not sel:
+            return
+        self.on_key_double_click_edit()
+
+    # Treeview 右键复制
+    def _on_stats_right_click(self, event):
+        sel = self.tree_stats.identify_row(event.y)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="复制", command=self._copy_stats_to_clipboard)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _copy_stats_to_clipboard(self):
+        items = self.tree_stats.selection()
+        if not items:
+            # 如果没有选中则复制全部
+            items = self.tree_stats.get_children()
+        rows = []
+        for it in items:
+            v = self.tree_stats.item(it, 'values')
+            rows.append(f"{v[0]}\t{v[1]}\t{v[2]}")
+        text = "\n".join(rows)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            messagebox.showinfo('已复制', '已复制选中统计到剪贴板')
+        except Exception as e:
+            messagebox.showerror('复制失败', str(e))
+
+    # Key 测试（保持原逻辑）
     def test_selected_key(self):
         sel = self.lb_keys.curselection()
         if not sel:
@@ -968,30 +1199,73 @@ class POICrawlerApp(tk.Tk):
         threading.Thread(target=self._test_key_thread, args=(key,), daemon=True).start()
 
     def _test_key_thread(self, key):
+        test_city = "110000"
+        test_poi_type = "050000"
+        test_grid = "116.3,39.9|116.4,39.8"
+        self.log_queue.put({'msg': f'开始测试Key {key[:6]}...（双接口：行政区划+POI）', 'level': 'INFO'})
+        district_pass = False
+        district_error = ""
         try:
-            self.log_queue.put({'msg': f'正在测试Key {key[:6]}...', 'level': 'INFO'})
-            r = requests.get('https://restapi.amap.com/v3/config/district',
-                             params={'key': key, 'keywords': '北京'}, timeout=10)
-            data = r.json()
+            resp = requests.get('https://restapi.amap.com/v3/config/district',
+                                params={'key': key, 'keywords': test_city, 'extensions': 'all'}, timeout=10)
+            data = resp.json()
             if data.get('status') == '1':
-                self.log_queue.put({'msg': f'Key 测试通过: {key[:6]}...', 'level': 'SUCCESS'})
+                district_pass = True
+                self.log_queue.put({'msg': f'Key {key[:6]}... 行政区划API测试通过', 'level': 'SUCCESS'})
             else:
-                info = data.get('info', '未知错误')
-                self.log_queue.put({'msg': f'Key 测试失败: {key[:6]}... ({info})', 'level': 'WARNING'})
-                # 标记Key进入冷却
-                self.key_manager.mark_key_cooldown(key)
-                self.refresh_key_stats()
+                district_error = data.get('info', '未知错误')
+                self.log_queue.put({'msg': f'Key {key[:6]}... 行政区划API测试失败: {district_error}', 'level': 'WARNING'})
         except Exception as e:
-            self.log_queue.put({'msg': f'Key 测试出错: {e}', 'level': 'ERROR'})
+            district_error = str(e)
+            self.log_queue.put({'msg': f'Key {key[:6]}... 行政区划API请求异常: {e}', 'level': 'ERROR'})
+
+        time.sleep(1)
+
+        poi_pass = False
+        poi_error = ""
+        try:
+            resp = requests.get('https://restapi.amap.com/v3/place/polygon',
+                                params={'key': key, 'polygon': test_grid, 'types': test_poi_type, 'offset': 10, 'page': 1},
+                                timeout=10)
+            data = resp.json()
+            if data.get('status') == '1':
+                poi_pass = True
+                self.log_queue.put({'msg': f'Key {key[:6]}... POI API测试通过', 'level': 'SUCCESS'})
+            else:
+                poi_error = data.get('info', '未知错误')
+                self.log_queue.put({'msg': f'Key {key[:6]}... POI API测试失败: {poi_error}', 'level': 'WARNING'})
+        except Exception as e:
+            poi_error = str(e)
+            self.log_queue.put({'msg': f'Key {key[:6]}... POI API请求异常: {e}', 'level': 'ERROR'})
+
+        self.log_queue.put({'msg': f'Key {key[:6]}... 测试汇总：', 'level': 'INFO'})
+        if district_pass and poi_pass:
+            self.log_queue.put({'msg': f'Key {key[:6]}... 双接口测试通过，可正常使用', 'level': 'SUCCESS'})
+        else:
+            error_msg = ""
+            if KEY_ERROR_PERMANENT in district_error or KEY_ERROR_PERMANENT in poi_error:
+                error_msg += "【永久无效（10001）】：Key错误、未激活或已过期，建议丢弃该Key；\n"
+                self.key_manager.permanent_invalid.add(key)
+            if KEY_ERROR_PLAT_MISMATCH in district_error or KEY_ERROR_PLAT_MISMATCH in poi_error:
+                error_msg += "【平台不匹配（10009）】：非Web服务端Key，需登录高德控制台修改Key类型；\n"
+                self.key_manager.plat_mismatch.add(key)
+            if KEY_ERROR_DAILY_LIMIT in district_error or KEY_ERROR_DAILY_LIMIT in poi_error:
+                error_msg += "【日超限（10044）】：POI接口配额已耗光，次日0点自动恢复；\n"
+            if KEY_ERROR_QPS_LIMIT in district_error or KEY_ERROR_QPS_LIMIT in poi_error:
+                error_msg += "【QPS超限】：请求过于频繁，稍后重试即可；\n"
+            if not error_msg:
+                error_msg = "【未知错误】：请检查网络或Key配置；\n"
+            self.log_queue.put({'msg': f'Key {key[:6]}... 测试失败，解决方案：{error_msg}', 'level': 'WARNING'})
+
+        self.refresh_key_stats()
 
     def refresh_key_stats(self):
-        """刷新Key统计，显示状态（包含使用次数和冷却信息）"""
         self.tree_stats.delete(*self.tree_stats.get_children())
         for k, v in self.key_manager.get_usage().items():
             status = self.key_manager.get_key_status(k)
-            self.tree_stats.insert('', 'end', values=(str(k)[:12] + '...', v, status))
+            self.tree_stats.insert('', 'end', values=(str(k)[:20] + '...', v, status))
 
-    # ================= 日志与任务控制 =================
+    # ================= 日志队列处理 =================
     def process_log_queue(self):
         try:
             while True:
@@ -1011,14 +1285,10 @@ class POICrawlerApp(tk.Tk):
         state = tk.NORMAL if enable else tk.DISABLED
         self.btn_start.config(state=state)
         self.btn_stop.config(state=tk.DISABLED if enable else tk.NORMAL)
-        # 锁定/解锁输入控件
+        self.btn_resume.config(state=tk.DISABLED)  # 只有在断点存在时启用
         self.key_entry.config(state=state)
-        self.type_var.set_readonly = lambda: state == tk.DISABLED
-        self.city_var.set_readonly = lambda: state == tk.DISABLED
-        self.grid_var.set_readonly = lambda: state == tk.DISABLED
-        self.output_path_var.set_readonly = lambda: state == tk.DISABLED
-        self.settings_file_var.set_readonly = lambda: state == tk.DISABLED
 
+    # ================= 启动/停止/断点/继续 控制 =================
     def start_task(self):
         keys = self.get_keys()
         types = [t.strip() for t in self.type_var.get().split(',') if t.strip()]
@@ -1040,15 +1310,20 @@ class POICrawlerApp(tk.Tk):
 
         self.is_running = True
         self.stop_event.clear()
+        self.pause_event.clear()
+        self.resume_event.clear()
         self.key_manager.set_keys(keys)
         self.key_manager.auto_rotate = self.auto_rotate_var.get()
-
         self.toggle_inputs(False)
         self.txt_log.config(state='normal')
         self.txt_log.delete(1.0, tk.END)
         self.txt_log.config(state='disabled')
         self.progress_var.set(0)
         self.lbl_status.config(text='正在初始化...', foreground='blue')
+
+        # 清除断点（新任务）
+        self.breakpoint = None
+        self.btn_resume.config(state=tk.DISABLED)
 
         self.worker_thread = threading.Thread(
             target=self.run_crawler,
@@ -1063,23 +1338,36 @@ class POICrawlerApp(tk.Tk):
                 self.stop_event.set()
                 self.lbl_status.config(text='正在停止...', foreground='red')
 
+    def resume_from_breakpoint(self):
+        """用户手动从断点继续"""
+        if not self.breakpoint:
+            messagebox.showinfo('提示', '当前没有断点可继续')
+            return
+        # 允许编辑 keys 后再开始
+        self.stop_event.clear()
+        self.pause_event.clear()
+        self.resume_event.set()
+        self.btn_resume.config(state=tk.DISABLED)
+        self.lbl_status.config(text='正在从断点继续...', foreground='blue')
+
+    # ================= 爬虫主流程（含断点保存/恢复） =================
     def run_crawler(self, keys, type_codes, city_codes, grid_size, output_dir):
-        # 传入城市边界缓存
         logic = AmapCrawlerLogic(self.log_queue, self.stop_event, self.city_boundary_cache)
         km = self.key_manager
 
         try:
             logic.log('正在计算任务规模...', 'INFO')
-            # 预估任务量逻辑
             estimate_grids = 0
+            city_grids_cache = {}
             for c in city_codes:
                 if self.stop_event.is_set():
                     break
                 poly, bbox = logic.get_city_coords(km, c)
                 if bbox:
                     grids = logic.generate_grids(poly, bbox, grid_size)
+                    city_grids_cache[c] = grids
                     estimate_grids += len(grids)
-                time.sleep(REQUEST_INTERVAL)  # 城市之间增加延迟
+                time.sleep(REQUEST_INTERVAL)
 
             total_tasks = len(type_codes) * max(1, estimate_grids)
             task_done = 0
@@ -1087,36 +1375,109 @@ class POICrawlerApp(tk.Tk):
             logic.log(f'任务开始: {len(type_codes)}个类型 x {len(city_codes)}个城市', 'INFO')
             logic.log(f'预计总任务量: {total_tasks} 个网格', 'INFO')
 
-            for t_code in type_codes:
+            # 主循环：支持从断点继续
+            t_index = 0
+            c_index = 0
+            g_index = 0
+
+            # 如果存在已记录的断点，则从断点开始（用户点击"从断点继续"会触发 resume_event）
+            if self.breakpoint:
+                bp = self.breakpoint
+                t_index = bp.get('t_index', 0)
+                c_index = bp.get('c_index', 0)
+                g_index = bp.get('g_index', 0)
+                task_done = bp.get('task_done', 0)
+                logic.log(f'检测到断点，准备从断点继续：类型索引 {t_index}, 城市索引 {c_index}, 网格索引 {g_index}', 'INFO')
+                # 等待用户按下继续（如果是被动暂停）
+                if self.pause_event.is_set():
+                    self.lbl_status.config(text='已在断点暂停，等待用户继续...', foreground='orange')
+                    self.btn_resume.config(state=tk.NORMAL)
+                    self.resume_event.clear()
+                    # 如果用户点击继续 resume_event 会被 set()
+                    self.resume_event.wait()
+                    self.lbl_status.config(text='继续运行中...', foreground='blue')
+
+            for t_idx in range(t_index, len(type_codes)):
                 if self.stop_event.is_set():
                     break
-                for c_code in city_codes:
+                t_code = type_codes[t_idx]
+                for c_idx in range(c_index if t_idx == t_index else 0, len(city_codes)):
                     if self.stop_event.is_set():
                         break
-
+                    c_code = city_codes[c_idx]
                     logic.log(f'\n===== 开始处理 POI类型: {t_code} - 城市编码: {c_code} =====', 'INFO')
 
-                    poly, bbox = logic.get_city_coords(km, c_code)
-                    if not bbox:
-                        logic.log(f'城市 {c_code} 边界获取失败，跳过', 'ERROR')
-                        time.sleep(ERROR_DELAY)
-                        continue
+                    # 获取 grids：优先使用之前计算缓存
+                    grids = city_grids_cache.get(c_code)
+                    if grids is None:
+                        poly, bbox = logic.get_city_coords(km, c_code)
+                        if not bbox:
+                            logic.log(f'城市 {c_code} 边界获取失败，跳过', 'ERROR')
+                            time.sleep(ERROR_DELAY)
+                            continue
+                        grids = logic.generate_grids(poly, bbox, grid_size)
 
-                    grids = logic.generate_grids(poly, bbox, grid_size)
                     filename = f'POI_{t_code}_{c_code}.csv'
                     filepath = os.path.join(output_dir, filename)
-
                     logic.log(f'城市 {c_code} 生成 {len(grids)} 个有效网格', 'INFO')
+
+                    # ========== 提前创建空CSV文件（带表头）- 即使无数据也生成文件 ==========
+                    POI_HEADER = [
+                        "poi_id", "name", "type", "typecode", "address", "tel",
+                        "cityname", "adname", "lon_gcj", "lat_gcj", "lon_wgs", "lat_wgs"
+                    ]
+                    # 仅当文件不存在时，创建带表头的空文件
+                    if not os.path.exists(filepath):
+                        try:
+                            empty_df = pd.DataFrame(columns=POI_HEADER)
+                            empty_df.to_csv(filepath, index=False, encoding='utf-8-sig')
+                            logic.log(f'  > 提前创建空文件：{filename}（含表头，无数据时保留）', 'INFO')
+                        except Exception as e:
+                            logic.log(f'  > 创建空文件失败：{str(e)}', 'ERROR')
+                    # ==============================================================================
+
                     time.sleep(REQUEST_INTERVAL)
 
-                    for i, grid in enumerate(grids):
+                    # 从 g_index 开始（如果是断点）
+                    start_g = g_index if (t_idx == t_index and c_idx == c_index) else 0
+                    for i in range(start_g, len(grids)):
                         if self.stop_event.is_set():
                             break
 
+                        grid = grids[i]
                         logic.log(f'\n----- 处理网格 {i + 1}/{len(grids)} -----', 'INFO')
-                        pois = logic.fetch_pois(km, t_code, grid)
 
-                        # 更新进度
+                        pois = logic.fetch_pois(km, t_code, grid)
+                        # 如果返回 None，表示当前没有可用 Key，触发断点暂停保存
+                        if pois is None:
+                            # 保存断点信息
+                            self.breakpoint = {
+                                't_index': t_idx,
+                                'c_index': c_idx,
+                                'g_index': i,
+                                't_code': t_code,
+                                'c_code': c_code,
+                                'task_done': task_done,
+                                'filepath': filepath,
+                                'grid': grid
+                            }
+                            self.pause_event.set()
+                            self.lbl_status.config(text='所有 Key 均不可用，已暂停并记录断点', foreground='orange')
+                            logic.log('所有 Key 均不可用，任务已在断点暂停，请修复 Key 并点击“从断点继续”', 'ERROR')
+                            # 允许用户修改 Key、导入新 Key 等
+                            self.toggle_inputs(True)
+                            self.btn_resume.config(state=tk.NORMAL)
+                            # 等待用户手动 resume（或 stop）
+                            self.resume_event.clear()
+                            self.resume_event.wait()
+                            # 恢复后继续（不重置断点，继续循环）
+                            self.lbl_status.config(text='已恢复，继续运行中...', foreground='blue')
+                            self.toggle_inputs(False)
+                            # 继续循环：获取最新 key manager 中的 keys
+                            km.set_keys(self.get_keys())
+                            continue
+
+                        # 正常返回列表（可能为空）
                         task_done += 1
                         prog = min(100, (task_done / total_tasks) * 100) if total_tasks else 0
                         self.progress_var.set(prog)
@@ -1130,18 +1491,27 @@ class POICrawlerApp(tk.Tk):
                         else:
                             logic.log(f'  > 网格{i + 1} 无数据', 'INFO')
 
-                        time.sleep(REQUEST_INTERVAL)  # 网格之间增加延迟
+                        time.sleep(REQUEST_INTERVAL)
 
+                    # 当前城市完成后，重置 g_index
+                    g_index = 0
                     logic.log(f'===== POI类型: {t_code} - 城市编码: {c_code} 处理完成 =====', 'SUCCESS')
-                    time.sleep(KEY_SWITCH_DELAY)  # 城市之间切换延迟
+                    time.sleep(KEY_SWITCH_DELAY)
 
-            # 任务结束后保存缓存
+                # 结束一个类型后，重置 c_index
+                c_index = 0
+
+            # 任务结束后保存缓存与配置
             self.city_boundary_cache = logic.city_boundary_cache
-            self.save_settings()  # 自动保存配置（包含缓存）
+            self.save_settings()
 
             logic.log('\n任务结束', 'INFO')
             logic.log(f'总处理网格数: {task_done} 个', 'INFO')
             logic.log(f'各Key使用统计: {km.get_usage()}', 'INFO')
+
+            # 清除断点（任务自然完成）
+            self.breakpoint = None
+            self.btn_resume.config(state=tk.DISABLED)
 
         except Exception as e:
             logic.log(f'任务发生未捕获异常: {e}', 'ERROR')
@@ -1151,7 +1521,6 @@ class POICrawlerApp(tk.Tk):
             self.toggle_inputs(True)
             self.lbl_status.config(text='完成', foreground='green')
             self.refresh_key_stats()
-
 
 if __name__ == '__main__':
     app = POICrawlerApp()
